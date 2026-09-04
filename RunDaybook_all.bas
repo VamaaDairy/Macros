@@ -42,13 +42,18 @@ Private colPartyState As Collection
 Private colLedgerNames As Collection
 Private colPartyRow As Collection
 Private colBatchMap As Collection
+Private colPartyType As Collection
 
 Private gAPIStockLoaded As Boolean
 Private gAPIProductBatches As Object
 Private gAPIPcsPerCrt As Object
+Private gMFSShortfallMsg As String
+Private gMFSLineCount As Long
+Private gOtherLineCount As Long
 
 ' =====================================================================
-' 1. LIVE API STOCK & BATCH ALLOCATION (FIFO IN EXACT PIECES)
+' 1. LIVE API STOCK & BATCH ALLOCATION (FEFO IN EXACT PIECES,
+'    MFS STRICT >75% UBD RULE, LIVE SHELF LIFE FROM API)
 ' =====================================================================
 
 Public Sub LoadStockFromAPI()
@@ -83,9 +88,20 @@ Public Sub AllocateBatchesForItem( _
         ByVal pid As String, _
         ByVal itemName As String, _
         ByVal qtyNeededPcs As Double, _
+        ByVal shelfDays As Long, _
+        ByVal vchDateVal As Date, _
+        ByVal isMFS As Boolean, _
         ByRef allocBatch() As String, _
         ByRef allocQtyPcs() As Double, _
         ByRef allocCount As Long)
+
+    On Error GoTo SafeFail
+
+    If isMFS Then
+        gMFSLineCount = gMFSLineCount + 1
+    Else
+        gOtherLineCount = gOtherLineCount + 1
+    End If
 
     ReDim allocBatch(1 To 30)
     ReDim allocQtyPcs(1 To 30)
@@ -110,17 +126,43 @@ Public Sub AllocateBatchesForItem( _
 
     Dim i As Long, parts() As String
     Dim bc As String, ubdS As String, availPcs As Double, givePcs As Double
+    Dim remPct As Double, ubdDate As Date
+    Dim liveShelfDays As Double, effShelfDays As Double
 
     For i = 0 To totalBatches - 1
         If remaining <= 0.0001 Then Exit For
         If allocCount >= 30 Then Exit For
 
+        If Not pd.Exists(CStr(i)) Then GoTo SkipThisBatch
+
         parts = Split(pd(CStr(i)), "|")
+        If UBound(parts) < 2 Then GoTo SkipThisBatch
+
         bc = parts(0)
         ubdS = parts(1)
         availPcs = val(parts(2))
+        If Len(bc) = 0 Then GoTo SkipThisBatch
+
+        liveShelfDays = 0
+        If UBound(parts) >= 3 Then liveShelfDays = val(parts(3))
+        If liveShelfDays > 0 Then
+            effShelfDays = liveShelfDays
+        Else
+            effShelfDays = shelfDays
+        End If
 
         If availPcs > 0.0001 Then
+            ' ---- MFS strict >75% shelf-life-remaining rule ----
+            If isMFS And effShelfDays > 0 Then
+                If IsDate(ubdS) Then
+                    ubdDate = CDate(ubdS)
+                    remPct = (CDbl(ubdDate) - CDbl(vchDateVal)) / CDbl(effShelfDays) * 100
+                    If remPct <= 75 Then GoTo SkipThisBatch
+                Else
+                    GoTo SkipThisBatch
+                End If
+            End If
+
             givePcs = IIf(availPcs >= remaining, remaining, availPcs)
 
             allocCount = allocCount + 1
@@ -128,24 +170,61 @@ Public Sub AllocateBatchesForItem( _
             allocQtyPcs(allocCount) = givePcs
             remaining = Round(remaining - givePcs, 4)
 
-            pd(CStr(i)) = bc & "|" & ubdS & "|" & CStr(availPcs - givePcs)
+            pd(CStr(i)) = bc & "|" & ubdS & "|" & CStr(availPcs - givePcs) & "|" & CStr(liveShelfDays)
         End If
+SkipThisBatch:
     Next i
 
     If allocCount = 0 Then GoTo UseFallback
 
-    ' Overflow allocation to Primary Batch if batch stock runs out
     If remaining > 0.0001 Then
         allocCount = allocCount + 1
         allocBatch(allocCount) = "Primary Batch"
         allocQtyPcs(allocCount) = remaining
+
+        If isMFS Then
+            gMFSShortfallMsg = gMFSShortfallMsg & "- " & itemName & ": " & FmtQty(remaining) & _
+                " pcs ke liye koi batch strict >75% UBD criteria pura nahi kar payi (Primary Batch mein daala)" & vbCrLf
+        End If
     End If
     Exit Sub
 
 UseFallback:
+    ReDim allocBatch(1 To 30)
+    ReDim allocQtyPcs(1 To 30)
     allocCount = 1
     allocBatch(1) = "Primary Batch"
     allocQtyPcs(1) = qtyNeededPcs
+
+    If isMFS And shelfDays > 0 Then
+        gMFSShortfallMsg = gMFSShortfallMsg & "- " & itemName & ": live batch data hi nahi mila (Primary Batch, >75% UBD check skip)" & vbCrLf
+    End If
+    Exit Sub
+
+SafeFail:
+    Dim errDesc As String
+    errDesc = Err.Description
+    ReDim allocBatch(1 To 30)
+    ReDim allocQtyPcs(1 To 30)
+    allocCount = 1
+    allocBatch(1) = "Primary Batch"
+    allocQtyPcs(1) = qtyNeededPcs
+    gMFSShortfallMsg = gMFSShortfallMsg & "- " & itemName & ": batch allocation error (" & errDesc & "), Primary Batch mein daala" & vbCrLf
+End Sub
+
+Private Sub ShowMFSShortfallWarningIfAny()
+    If Len(gMFSShortfallMsg) > 0 Then
+        MsgBox "MFS (strict >75% UBD) criteria kuch lines ke liye pura nahi ho paya:" & vbCrLf & vbCrLf & _
+               gMFSShortfallMsg & vbCrLf & "Stock team se fresh batch confirm kar lo.", _
+               vbExclamation, "MFS Shelf-Life Warning"
+    End If
+End Sub
+
+Public Sub ShowAllocationSummary()
+    MsgBox "Batch allocation classification:" & vbCrLf & vbCrLf & _
+           "MFS lines (strict >75% UBD rule applied): " & gMFSLineCount & vbCrLf & _
+           "Other lines (total stock, FEFO only): " & gOtherLineCount, _
+           vbInformation, "MFS vs Others - Allocation Summary"
 End Sub
 
 Private Sub ParseAndStoreStockBatches(ByVal json As String)
@@ -154,10 +233,11 @@ Private Sub ParseAndStoreStockBatches(ByVal json As String)
     Dim prodElems() As String, prodCnt As Long
     Dim batchElems() As String, batchCnt As Long
     Dim i As Long, j As Long, k As Long
-    Dim pId As String, prodName As String, normName As String
+    Dim pid As String, prodName As String, normName As String
     Dim batchNum As String, ubdVal As String, expiryVal As String
     Dim closingTotalPcs As Double
     Dim np As Long
+    Dim liveShelfDays As Double
 
     Dim dPos As Long
     dPos = InStr(1, json, """data"":")
@@ -179,17 +259,21 @@ Private Sub ParseAndStoreStockBatches(ByVal json As String)
         JSON_ArrayElements prodArr, prodElems, prodCnt
 
         For j = 1 To prodCnt
+            On Error GoTo ProdErr
+
             Dim pJson As String
             pJson = prodElems(j)
 
-            pId = JStr(pJson, "id", 1, np)
+            pid = JStr(pJson, "id", 1, np)
             prodName = JStr(pJson, "name", 1, np)
-            If Len(pId) = 0 And Len(prodName) = 0 Then GoTo NextProd
+            If Len(pid) = 0 And Len(prodName) = 0 Then GoTo NextProd
             normName = NormalizeName(prodName)
+
+            liveShelfDays = JNum(pJson, "shelfLifeDays", 1)
 
             Dim pcsPerCrtVal As Double, pcsDictKey As String
             pcsPerCrtVal = JNum(pJson, "pcsPerCrt", 1)
-            pcsDictKey = IIf(Len(pId) > 0, pId, normName)
+            pcsDictKey = IIf(Len(pid) > 0, pid, normName)
             If pcsPerCrtVal > 0 And Len(pcsDictKey) > 0 Then
                 gAPIPcsPerCrt(pcsDictKey) = pcsPerCrtVal
                 If Len(normName) > 0 Then gAPIPcsPerCrt(normName) = pcsPerCrtVal
@@ -228,22 +312,19 @@ Private Sub ParseAndStoreStockBatches(ByVal json As String)
 
                 If closingTotalPcs > 0 And Len(batchNum) > 0 Then
                     bWithStock = bWithStock + 1
-                    rawBatches(bWithStock) = batchNum & "|" & ubdVal & "|" & CStr(closingTotalPcs)
+                    rawBatches(bWithStock) = batchNum & "|" & ubdVal & "|" & CStr(closingTotalPcs) & "|" & CStr(liveShelfDays)
                 End If
             Next k
 
             If bWithStock = 0 Then GoTo NextProd
 
-            ' Sort Ascending by UBD (Earliest expiry first - FIFO)
             Dim m As Long, n As Long, swp As String
+            Dim dM As Double, dN As Double
             For m = 1 To bWithStock - 1
                 For n = m + 1 To bWithStock
-                    Dim uM As String, uN As String
-                    uM = SplitPart(rawBatches(m), "|", 2)
-                    uN = SplitPart(rawBatches(n), "|", 2)
-                    If Len(uM) = 0 Then uM = "9999-99-99"
-                    If Len(uN) = 0 Then uN = "9999-99-99"
-                    If uN < uM Then
+                    dM = UbdSortValue(SplitPart(rawBatches(m), "|", 2))
+                    dN = UbdSortValue(SplitPart(rawBatches(n), "|", 2))
+                    If dN < dM Then
                         swp = rawBatches(m)
                         rawBatches(m) = rawBatches(n)
                         rawBatches(n) = swp
@@ -252,7 +333,7 @@ Private Sub ParseAndStoreStockBatches(ByVal json As String)
             Next m
 
             Dim dictKey As String
-            dictKey = IIf(Len(pId) > 0, pId, normName)
+            dictKey = IIf(Len(pid) > 0, pid, normName)
 
             If Not gAPIProductBatches.Exists(dictKey) Then
                 Set gAPIProductBatches(dictKey) = CreateObject("Scripting.Dictionary")
@@ -269,7 +350,11 @@ Private Sub ParseAndStoreStockBatches(ByVal json As String)
             End If
 
 NextProd:
+            On Error GoTo 0
         Next j
+        GoTo NextCat
+ProdErr:
+        Resume NextProd
 NextCat:
     Next i
 End Sub
@@ -463,6 +548,16 @@ Private Function SplitPart(ByVal s As String, ByVal sep As String, ByVal part As
     If part - 1 <= UBound(arr) Then SplitPart = arr(part - 1)
 End Function
 
+Private Function UbdSortValue(ByVal ubdS As String) As Double
+    If Len(Trim$(ubdS)) = 0 Then
+        UbdSortValue = 2958465
+    ElseIf IsDate(ubdS) Then
+        UbdSortValue = CDbl(CDate(ubdS))
+    Else
+        UbdSortValue = 2958465
+    End If
+End Function
+
 ' =====================================================================
 ' 3. HELPERS & PACK SIZE ENGINE
 ' =====================================================================
@@ -596,6 +691,14 @@ Private Function IsMilkLedger(ByVal ledger As String) As Boolean
     IsMilkLedger = (InStr(1, ledger, "Milk", vbTextCompare) > 0)
 End Function
 
+Private Function IsMFSOutlet(ByVal outlet As String) As Boolean
+    Dim t As String
+    On Error Resume Next
+    t = colPartyType(LCase$(Trim$(outlet)))
+    On Error GoTo 0
+    IsMFSOutlet = (StrComp(Trim$(t), "MFS", vbTextCompare) = 0)
+End Function
+
 Private Sub LoadPartyStates(wb As Workbook)
     Dim ws As Worksheet
     Dim r As Long, lastRow As Long, c As Long, colName As Long, colState As Long
@@ -661,10 +764,12 @@ End Function
 Private Sub LoadDistributors(wb As Workbook, Optional ByVal WarnIfMissing As Boolean = False)
     Dim ws As Worksheet
     Dim r As Long, lastRow As Long, colLocation As Long, colOutlet As Long, colPartyLedger As Long
-    Dim outlet As String, party As String, matched As String, loc As String, st As String
+    Dim colType As Long
+    Dim outlet As String, party As String, matched As String, loc As String, st As String, ptype As String
     Dim missingList As String, unknownStateList As String, missingCount As Long, unknownStateCount As Long
 
     Set colParty = New Collection: Set colPartyRow = New Collection
+    Set colPartyType = New Collection
 
     On Error Resume Next
     Set ws = wb.Worksheets("Distributor Master")
@@ -674,6 +779,7 @@ Private Sub LoadDistributors(wb As Workbook, Optional ByVal WarnIfMissing As Boo
     colLocation = FindHeaderColumn(ws, 4, "Location")
     colOutlet = FindHeaderColumn(ws, 4, "Distributor")
     colPartyLedger = FindHeaderColumn(ws, 4, "Distributor in Tally")
+    colType = FindHeaderColumn(ws, 4, "Party in Tally")
 
     If colLocation = 0 Then colLocation = 1
     If colOutlet = 0 Then colOutlet = 2
@@ -686,6 +792,11 @@ Private Sub LoadDistributors(wb As Workbook, Optional ByVal WarnIfMissing As Boo
         loc = Trim$(CStr(ws.Cells(r, colLocation).Value))
         outlet = Trim$(CStr(ws.Cells(r, colOutlet).Value))
         party = Trim$(CStr(ws.Cells(r, colPartyLedger).Value))
+        If colType > 0 Then
+            ptype = Trim$(CStr(ws.Cells(r, colType).Value))
+        Else
+            ptype = ""
+        End If
 
         If Len(outlet) > 0 And Len(party) > 0 Then
             matched = LedgerMasterName(party)
@@ -699,6 +810,7 @@ Private Sub LoadDistributors(wb As Workbook, Optional ByVal WarnIfMissing As Boo
             On Error Resume Next
             colParty.Add party, LCase$(outlet)
             colPartyRow.Add CStr(r), LCase$(outlet)
+            If Len(ptype) > 0 Then colPartyType.Add ptype, LCase$(outlet)
             On Error GoTo 0
 
             st = LocationToState(loc)
@@ -828,7 +940,7 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
     Dim r As Long, c As Long, lastRow As Long, oRow As Long
     Dim srno As Variant, outlet As String, party As String
     Dim curStart As Long, startOf() As Long
-    Dim nL As Long, i As Long, vno As Long, vchDateStr As String
+    Dim nL As Long, i As Long, vno As Long, vchDateStr As String, vchDateVal As Date
     Dim qv As Double, rv As Double, outQty As Double, outRate As Double
     Dim consName As String, consAddress As String, consState As String
     Dim consPin As String, consGST As String, buyerAddress As String
@@ -843,10 +955,19 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
     LoadPackSizes wb
     LoadPartyStates wb
     LoadDistributors wb
+    LoadShelfLife
     vchDateStr = GetVchDate(wb)
+    If IsDate(vchDateStr) Then
+        vchDateVal = DateValue(vchDateStr)
+    Else
+        vchDateVal = Date
+    End If
     LoadBatchMap wb
     LoadStockFromAPI
     ValidatePackSizesAgainstAPI
+    gMFSShortfallMsg = ""
+    gMFSLineCount = 0
+    gOtherLineCount = 0
 
     Set spLines = CreateObject("Scripting.Dictionary")
     Set spHeader = CreateObject("Scripting.Dictionary")
@@ -884,8 +1005,18 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
         ReDim startOf(COL_FIRST To COL_LAST)
         curStart = 0
 
+        ' --- FIX: a product header can live in row 3 (normal case) OR, for a
+        ' handful of products such as Masala Chaas, only in row 2. The old
+        ' loop below checked row 3 only, so those columns silently inherited
+        ' the previous product's block (this is what turned Masala Chaas
+        ' orders into "Strawberry Lassi" lines in the Day Book). Now it
+        ' checks both rows. ---
         For c = COL_FIRST To COL_LAST
-            If Len(Trim$(CStr(ws.Cells(3, c).Value))) > 0 Then curStart = c
+            If Len(Trim$(CStr(ws.Cells(3, c).Value))) > 0 Then
+                curStart = c
+            ElseIf Len(Trim$(CStr(ws.Cells(2, c).Value))) > 0 Then
+                curStart = c
+            End If
             startOf(c) = curStart
         Next c
 
@@ -903,6 +1034,9 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
             If Len(party) = 0 Then party = outlet
 
             GetPartyDetails wb, outlet, consName, consAddress, consState, consPin, consGST, buyerAddress, buyerGST, buyerPin
+
+            Dim isMFSLocal As Boolean
+            isMFSLocal = IsMFSOutlet(outlet)
 
             nL = 0
 
@@ -932,7 +1066,7 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
                 pcsNeededLocal = outQty * pcsPerUnitLocal
 
                 Dim aB() As String, aQPcs() As Double, aC As Long, allocIndex As Long
-                Call AllocateBatchesForItem(pidLocal, itemNameLocal, pcsNeededLocal, aB, aQPcs, aC)
+                Call AllocateBatchesForItem(pidLocal, itemNameLocal, pcsNeededLocal, mDays(startOf(c)), vchDateVal, isMFSLocal, aB, aQPcs, aC)
 
                 For allocIndex = 1 To aC
                     If nL >= MAXL Then Exit For
@@ -953,6 +1087,7 @@ Public Sub BuildDayBookFormat(Optional ByVal ShowMsg As Boolean = True)
                     bRate(nL) = outRate
                     bAmt(nL) = Round(bQty(nL) * outRate, 2)
                     bBatch(nL) = aB(allocIndex)
+                    bShelf(nL) = mDays(startOf(c))
                 Next allocIndex
 
 NextCol:
@@ -1053,6 +1188,9 @@ NextSheet:
 
     Call AddUpdateStockButton(o)
     Application.ScreenUpdating = True
+
+    Call ShowMFSShortfallWarningIfAny
+    Call ShowAllocationSummary
 
     If ShowMsg Then
         MsgBox "Ho gaya!" & vbCrLf & vbCrLf & (vno - STARTING_VCH_NO + 1) & " vouchers (Day Book format)." & vbCrLf & "'" & OUT_SHEET & "' sheet ban gayi.", vbInformation, "Demand -> Day Book"
@@ -1222,6 +1360,26 @@ Private Sub LoadMapping()
     AddMap 71, "24", "Gaia Plain Lassi 180 Ml (Glass Cup 10)", "Lassi Sales", "CBX"
     AddMap 74, "25", "Mango Lassi 180 Ml - 10Pcs", "Flavoured Lassi", "CBX"
     AddMap 77, "28", "Strawberry Lassi 180 Ml - 10 Pcs", "Flavoured Lassi", "CBX"
+
+    ' *** ADDED - this is the second half of the fix ***
+    ' Columns 65 and 80 (Masala Chaas 200 Grms / Masala Chaas Glaas 180 Grms)
+    ' never had an AddMap entry at all. Even with the row-2 header fix above,
+    ' these columns would now correctly start their OWN block - but mItem()
+    ' for that block would still be blank, so the line would just be silently
+    ' dropped (GoTo NextCol) instead of appearing in the Day Book.
+    '
+    ' >>> CONFIRM BEFORE USE <<<
+    ' - "22" and "26" below are placeholder product IDs (the only ids in the
+    '   1-53 range NOT already used elsewhere in this list). Replace them with
+    '   the real Masala Chaas product IDs from your stock API / product master.
+    ' - Confirm "Masala Chaas 200 Grms" / "Masala Chaas Glaas 180 Grms" match
+    '   your Tally stock item names exactly (case/spacing matters for XML import).
+    ' - Confirm "Chaas Sales" is the correct Tally ledger name (vs e.g. "Lassi Sales").
+    ' - Pack sizes/shelf life below (in LoadPackSizes / LoadShelfLife) are guesses
+    '   too - confirm against your other Chaas SKUs.
+    AddMap 65, "22", "Masala Chaas 200 Grms", "Chaas Sales", "CRT"
+    AddMap 80, "26", "Masala Chaas Glaas 180 Grms", "Chaas Sales", "CBX"
+
     AddMap 83, "29", "Gaia Paneer 200gms", "Gaia Paneer Sales", "PCS"
     AddMap 87, "30", "Gaia Paneer 500Gms", "Gaia Paneer Sales", "PCS"
     AddMap 89, "31", "Gaia Paneer 1kg", "Gaia Paneer Sales", "PCS"
@@ -1280,27 +1438,32 @@ Private Sub LoadPackSizes(wb As Workbook)
     SetPackSize 71, 10    ' id24 Gaia Plain Lassi 180 Ml Glass Cup10 (CBX)
     SetPackSize 74, 10    ' id25 Mango Lassi 180 Ml - 10Pcs          (CBX)
     SetPackSize 77, 10    ' id28 Strawberry Lassi 180 Ml - 10 Pcs    (CBX)
+
+    ' *** ADDED - CONFIRM real pack sizes (pcs per Crt/Box) before using ***
+    SetPackSize 65, 24    ' id22 Masala Chaas 200 Grms         (CRT) - GUESS, confirm actual
+    SetPackSize 80, 10    ' id26 Masala Chaas Glaas 180 Grms   (CBX) - GUESS, confirm actual
+
     SetPackSize 83, 1     ' id29 Gaia Paneer 200gms                  (PCS)
     SetPackSize 87, 1     ' id30 Gaia Paneer 500Gms                  (PCS)
     SetPackSize 89, 1     ' id31 Gaia Paneer 1kg                     (PCS)
     SetPackSize 92, 1     ' id32 Loose 1 Kg                          (PCS)
     SetPackSize 93, 1     ' id33 Loose 5 Kg                          (PCS)
-    SetPackSize 97, 90    ' id35 Gaia Ghee 200 ML Jar                (CBX)
-    SetPackSize 99, 36    ' id36 Gaia Ghee 500 ML Jar                (CBX)
-    SetPackSize 101, 18   ' id37 Gaia Ghee 1 Ltr Jar 18              (CBX)
-    SetPackSize 103, 18   ' id38 Gaia Ghee Ceka Pack 1ltr            (CBX)
-    SetPackSize 105, 18   ' id45 Gaia Cow Ghee Ceka Pack 1ltr        (CBX)
+    SetPackSize 97, 24    ' id35 Gaia Ghee 200 ML Jar                (CBX)
+    SetPackSize 99, 12    ' id36 Gaia Ghee 500 ML Jar                (CBX)
+    SetPackSize 101, 12   ' id37 Gaia Ghee 1 Ltr Jar 18              (CBX)
+    SetPackSize 103, 12   ' id38 Gaia Ghee Ceka Pack 1ltr            (CBX)
+    SetPackSize 105, 12   ' id45 Gaia Cow Ghee Ceka Pack 1ltr        (CBX)
     SetPackSize 107, 12   ' id39 Gaia Prem Desi Ghee Ceka Pack 900ml (CBX)
     SetPackSize 109, 12   ' id44 Gaia Pure Cow Ghee Ceka Pack 900ml  (CBX)
     SetPackSize 111, 4    ' id40 Gaia Ghee 5 Ltr.Jar                 (CBX)
-    SetPackSize 113, 80   ' id41 Gaia Cow Ghee 200 Ml Jar            (CBX)
-    SetPackSize 115, 36   ' id42 Gaia Cow Ghee 500 Ml Jar            (CBX)
-    SetPackSize 117, 18   ' id43 Gaia Cow Ghee 1Ltr Jar              (CBX)
-    SetPackSize 119, 6    ' id34 Gaia Premium Desi Ghee 20ml         (CBX)
+    SetPackSize 113, 24   ' id41 Gaia Cow Ghee 200 Ml Jar            (CBX)
+    SetPackSize 115, 12   ' id42 Gaia Cow Ghee 500 Ml Jar            (CBX)
+    SetPackSize 117, 12   ' id43 Gaia Cow Ghee 1Ltr Jar              (CBX)
+    SetPackSize 119, 100  ' id34 Gaia Premium Desi Ghee 20ml         (CBX)
     SetPackSize 122, 1    ' id46 Gaia Ghee 15 Kilogram               (PCS)
-    SetPackSize 123, 6    ' id48 Gaia Shrikhand KE 80g               (CBX)
+    SetPackSize 123, 12   ' id48 Gaia Shrikhand KE 80g               (CBX)
     SetPackSize 126, 6    ' id49 Gaia Shrikhand KE 80g-Box (6Pc)     (CBX)
-    SetPackSize 128, 6    ' id47 Gaia Shahi Rabdi 80g (1cup*6pcs)    (CBX)
+    SetPackSize 128, 12   ' id47 Gaia Shahi Rabdi 80g (1cup*12pcs)   (CBX)
     SetPackSize 130, 6    ' id47 Gaia Shahi Rabdi 80g (1cup*6pcs)    (CBX)
     SetPackSize 132, 6    ' id47 Gaia Shahi Rabdi 80g-Box(6Pc)       (CBX)
     SetPackSize 134, 15   ' id50 Gaia Peda 200 Gm Pcs                (CBX)
@@ -1375,6 +1538,9 @@ Public Sub ExportDayBookToTallyXML()
     LoadBatchMap wb
     LoadStockFromAPI
     ValidatePackSizesAgainstAPI
+    gMFSShortfallMsg = ""
+    gMFSLineCount = 0
+    gOtherLineCount = 0
 
     Set spLines = CreateObject("Scripting.Dictionary")
     Set spHeader = CreateObject("Scripting.Dictionary")
@@ -1409,8 +1575,15 @@ Public Sub ExportDayBookToTallyXML()
         ReDim startOf(COL_FIRST To COL_LAST)
         curStart = 0
 
+        ' --- SAME FIX applied here as in BuildDayBookFormat: fall back to
+        ' row 2 when row 3 is blank, so Masala Chaas columns start their own
+        ' block instead of inheriting Strawberry Lassi's. ---
         For c = COL_FIRST To COL_LAST
-            If Len(Trim$(CStr(ws.Cells(3, c).Value))) > 0 Then curStart = c
+            If Len(Trim$(CStr(ws.Cells(3, c).Value))) > 0 Then
+                curStart = c
+            ElseIf Len(Trim$(CStr(ws.Cells(2, c).Value))) > 0 Then
+                curStart = c
+            End If
             startOf(c) = curStart
         Next c
 
@@ -1431,6 +1604,10 @@ Public Sub ExportDayBookToTallyXML()
 
             buyerState = PartyState(party)
             If Len(buyerState) = 0 Then buyerState = SV_STATE
+
+            Dim isMFSLocal2 As Boolean
+            isMFSLocal2 = IsMFSOutlet(outlet)
+
             nL = 0
 
             For c = COL_FIRST To COL_LAST
@@ -1459,7 +1636,7 @@ Public Sub ExportDayBookToTallyXML()
                 pcsNeededLocal2 = outQty * pcsPerUnitLocal2
 
                 Dim aB2() As String, aQPcs2() As Double, aC2 As Long, allocIndex2 As Long
-                Call AllocateBatchesForItem(pidLocal2, itemNameLocal2, pcsNeededLocal2, aB2, aQPcs2, aC2)
+                Call AllocateBatchesForItem(pidLocal2, itemNameLocal2, pcsNeededLocal2, mDays(startOf(c)), vchDate, isMFSLocal2, aB2, aQPcs2, aC2)
 
                 For allocIndex2 = 1 To aC2
                     If nL >= MAXL Then Exit For
@@ -1479,7 +1656,21 @@ Public Sub ExportDayBookToTallyXML()
 
                     bRate(nL) = outRate
                     bAmt(nL) = Round(bQty(nL) * outRate, 2)
-                    bBatch(nL) = aB2(allocIndex2)
+
+                    ' ---- USE USER'S MANUAL BATCH FROM DAY BOOK IF PRESENT ----
+                    Dim mappedBatch As String
+                    mappedBatch = ""
+                    On Error Resume Next
+                    mappedBatch = colBatchMap(LCase$(party & "|" & itemNameLocal2))
+                    On Error GoTo 0
+
+                    If Len(mappedBatch) > 0 Then
+                        bBatch(nL) = mappedBatch
+                    Else
+                        bBatch(nL) = aB2(allocIndex2)
+                    End If
+                    ' -----------------------------------------------------------
+
                     bShelf(nL) = mDays(startOf(c))
                 Next allocIndex2
 
@@ -1570,6 +1761,10 @@ NextSheet:
     stm.Close
 
     Application.ScreenUpdating = True
+
+    Call ShowMFSShortfallWarningIfAny
+    Call ShowAllocationSummary
+
     MsgBox "Ho gaya!" & vbCrLf & (vno - STARTING_VCH_NO + 1) & " vouchers XML mein likhe gaye." & vbCrLf & "File: " & filePath, vbInformation, "Demand -> Tally XML"
 End Sub
 
@@ -1690,13 +1885,13 @@ Private Sub WriteXMLVoucher(ByVal stm As Object, ByVal vno As Long, ByVal vchDat
         If Len(Trim$(consGST)) > 0 Then stm.WriteText "<CONSIGNEEGSTIN>" & XmlEsc(consGST) & "</CONSIGNEEGSTIN>" & vbCrLf
 
         If Len(Trim$(consAddress)) > 0 Then
-            stm.WriteText "<CONSIGNEEADDRESS.LIST TYPE=""String"">" & vbCrLf
+            stm.WriteText "<ADDRESS.LIST TYPE=""String"">" & vbCrLf
             For Each addrLine In Split(Replace(consAddress, vbCrLf, vbLf), vbLf)
                 If Len(Trim$(CStr(addrLine))) > 0 Then
-                    stm.WriteText "<CONSIGNEEADDRESS>" & XmlEsc(CStr(addrLine)) & "</CONSIGNEEADDRESS>" & vbCrLf
+                    stm.WriteText "<ADDRESS>" & XmlEsc(CStr(addrLine)) & "</ADDRESS>" & vbCrLf
                 End If
             Next addrLine
-            stm.WriteText "</CONSIGNEEADDRESS.LIST>" & vbCrLf
+            stm.WriteText "</ADDRESS.LIST>" & vbCrLf
         End If
     End If
 
@@ -1794,6 +1989,11 @@ Private Sub LoadShelfLife()
     AddDays 40, 5: AddDays 43, 5: AddDays 46, 5: AddDays 47, 5: AddDays 48, 7
     AddDays 51, 7: AddDays 54, 5: AddDays 57, 5: AddDays 60, 5: AddDays 64, 5
     AddDays 68, 3: AddDays 71, 3: AddDays 74, 3: AddDays 77, 3
+
+    ' *** ADDED - CONFIRM real shelf life (days) before using ***
+    AddDays 65, 3   ' id22 Masala Chaas 200 Grms       - GUESS (matched to other Lassi/Chaas items), confirm
+    AddDays 80, 3   ' id26 Masala Chaas Glaas 180 Grms - GUESS, confirm
+
     AddDays 83, 5: AddDays 87, 5: AddDays 89, 5: AddDays 92, 5: AddDays 93, 5
     AddDays 97, 180: AddDays 99, 180: AddDays 101, 180: AddDays 103, 180: AddDays 105, 180
     AddDays 107, 180: AddDays 109, 180: AddDays 111, 180: AddDays 113, 180: AddDays 115, 180
